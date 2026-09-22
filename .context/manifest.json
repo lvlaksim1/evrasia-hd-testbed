@@ -1,0 +1,41 @@
+{
+  "schema": "context-capsule-manifest",
+  "schema_version": 3,
+  "repository": "lvlaksim1/evrasia-hd-testbed",
+  "authoritative_branch": "main",
+  "discovery_branch": "main",
+  "branch_mode": "single",
+  "entrypoint": ".context/ENTRYPOINT.md",
+  "capsule_metadata": ".context/capsule.json",
+  "protocol": ".context/protocol.md",
+  "latest_handoff": ".context/handoffs/latest.md",
+  "project": {
+    "identity": ".context/project/identity.md",
+    "goals": ".context/project/goals.md",
+    "architecture": ".context/project/architecture.md",
+    "constraints": ".context/project/constraints.md"
+  },
+  "current": {
+    "state": ".context/current/state.md",
+    "blockers": ".context/current/blockers.md",
+    "next": ".context/current/next.md"
+  },
+  "current_state": ".context/current/state.md",
+  "rules": [
+    ".context/rules/project-rules.md"
+  ],
+  "decisions": [],
+  "dialogues": [],
+  "history": [],
+  "runtime": {
+    "authoritative_paths": [],
+    "volatile": false,
+    "promote_semantic_changes_only": false
+  },
+  "sync_policy": {
+    "semantic_only": true,
+    "volatile_runtime_excluded": true,
+    "atomic_git_publication": true
+  },
+  "updated_at": "2026-09-22"
+}
