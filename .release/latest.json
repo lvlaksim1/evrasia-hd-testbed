@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "releaseNumber": 14,
+  "tag": "v14",
+  "versionCode": 14,
+  "versionName": "v14",
+  "packageId": "com.evrasia.hd",
+  "commit": "92f6ba606bf1069c5128d91739df4b075fd413cf",
+  "artifact": "evrasia-hd-v14.apk",
+  "sha256": "a4a56e10bdc0d44cd144c39a8e29a3a694bfcd8959c5170364d2d787d4add09f",
+  "publishedAt": "2026-09-10T23:25:14Z",
+  "previousRelease": "v13",
+  "releaseUrl": "https://github.com/lvlaksim1/evrasia-hd/releases/tag/v14",
+  "artifactUrl": "https://github.com/lvlaksim1/evrasia-hd/releases/download/v14/evrasia-hd-v14.apk",
+  "commits": [
+    "v14: eliminate sortable list commit flicker [release]"
+  ],
+  "changedFiles": [
+    "App.tsx"
+  ]
+}

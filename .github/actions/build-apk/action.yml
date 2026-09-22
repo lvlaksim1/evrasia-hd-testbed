@@ -1,0 +1,155 @@
+name: L3 Project APK Builder
+description: Build the Evrasia HD project-specific unsigned APK candidate
+
+inputs:
+  release_number:
+    description: Numeric APK release version supplied by L2
+    required: true
+
+outputs:
+  apk_path:
+    description: Path to the unsigned APK candidate
+    value: ${{ steps.result.outputs.apk_path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up pnpm
+      uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      with:
+        version: 9.12.0
+
+    - name: Set up Node.js 22
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version: "22"
+        cache: pnpm
+        cache-dependency-path: pnpm-lock.yaml
+
+    - name: Install project Android SDK
+      shell: bash
+      run: |
+        set -euo pipefail
+        sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        pnpm install --frozen-lockfile
+
+    - name: Prepare app assets
+      shell: bash
+      run: |
+        set -euo pipefail
+        base64 -d assets/icon.png.b64 > assets/icon.png
+        test -s assets/icon.png
+        test -s assets/evrasia_hd_logo.png
+        test -s assets/evrasia_hd_glitch.mp4
+        echo "935a52492868d083469f52e13e99219d23db6287479dd4931eb64b6ad96845b3  assets/evrasia_hd_logo.png" | sha256sum -c -
+        echo "ed6f44dc7e7c384aa70e97ca46bfc75963dbd18f145b25082e435b9b71cd85b4  assets/evrasia_hd_glitch.mp4" | sha256sum -c -
+
+    - name: TypeScript check
+      shell: bash
+      run: |
+        set -euo pipefail
+        pnpm exec tsc --noEmit
+
+    - name: Remember source screen hash
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "SOURCE_SCREEN_HASH=$(sha256sum 'App.tsx' | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+    - name: Expo prebuild
+      env:
+        RELEASE_VERSION_CODE: ${{ inputs.release_number }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        pnpm exec expo prebuild --platform android --no-install --clean
+
+    - name: Verify generated Android project
+      shell: bash
+      run: |
+        set -euo pipefail
+        grep -Eq '^newArchEnabled=true$' android/gradle.properties
+        grep -Eq '^reactNativeArchitectures=arm64-v8a$' android/gradle.properties
+        grep -Fq 'android:windowSoftInputMode="adjustResize"' android/app/src/main/AndroidManifest.xml
+        ACTUAL=$(sha256sum 'App.tsx' | cut -d' ' -f1)
+        test "$SOURCE_SCREEN_HASH" = "$ACTUAL" || { echo 'prebuild changed source index.tsx' >&2; exit 1; }
+
+    - name: TypeScript check after prebuild
+      shell: bash
+      run: |
+        set -euo pipefail
+        pnpm exec tsc --noEmit
+
+    - name: Remove generated release signing
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import re
+        from pathlib import Path
+
+        path = Path("android/app/build.gradle")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        output = []
+        depth = 0
+        in_build_types = False
+        build_types_depth = None
+        in_release = False
+        release_depth = None
+        removed = 0
+
+        for line in lines:
+            stripped = line.strip()
+
+            if not in_build_types and re.match(r"buildTypes\s*\{", stripped):
+                in_build_types = True
+                build_types_depth = depth
+            elif in_build_types and not in_release and re.match(r"release\s*\{", stripped):
+                in_release = True
+                release_depth = depth
+
+            if in_release and re.fullmatch(r"signingConfig\s+signingConfigs\.[A-Za-z0-9_]+", stripped):
+                removed += 1
+            else:
+                output.append(line)
+
+            depth += line.count("{") - line.count("}")
+
+            if in_release and release_depth is not None and depth <= release_depth:
+                in_release = False
+                release_depth = None
+            if in_build_types and build_types_depth is not None and depth <= build_types_depth:
+                in_build_types = False
+                build_types_depth = None
+
+        if removed != 1:
+            raise SystemExit(f"Expected exactly one release signingConfig, removed {removed}")
+
+        path.write_text("\n".join(output) + "\n", encoding="utf-8")
+        PY
+
+    - name: Set up generated project Gradle
+      uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+
+    - name: Build unsigned release APK
+      env:
+        RELEASE_VERSION_CODE: ${{ inputs.release_number }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd android
+        ./gradlew :app:assembleRelease --no-daemon
+
+    - name: Return APK candidate
+      id: result
+      shell: bash
+      run: |
+        set -euo pipefail
+        APK_PATH="android/app/build/outputs/apk/release/app-release-unsigned.apk"
+        test -s "$APK_PATH"
+        echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"

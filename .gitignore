@@ -1,0 +1,13 @@
+node_modules/
+.expo/
+android/
+ios/
+dist/
+*.log
+*.jks
+*.keystore
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
