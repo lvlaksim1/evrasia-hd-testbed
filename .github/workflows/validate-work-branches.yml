@@ -1,0 +1,107 @@
+name: Validate Android work branches
+
+on:
+  push:
+    branches:
+      - '*-work'
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  validate-apk:
+    uses: ./.github/workflows/_release-apk.yml
+    with:
+      mode: validate
+      expected_package_id: com.evrasia.hd
+
+  validate-release-docs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository with release history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+
+      - name: Install APK metadata tools
+        shell: bash
+        run: sdkmanager --install "build-tools;35.0.0"
+
+      - name: Verify documentation generator against latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+
+          RELEASE_TAGS=$(gh api --paginate "/repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
+          RELEASE_NUMBER=$(printf '%s\n' "$RELEASE_TAGS" | sed -nE 's/^v([0-9]+)$/\1/p' | sort -n | tail -1)
+
+          if [ -z "$RELEASE_NUMBER" ]; then
+            echo "No published stable numeric release exists yet; release documentation validation skipped for bootstrap state before v1"
+            {
+              echo "## Release documentation validation"
+              echo
+              echo "No published stable numeric release exists yet. Bootstrap state before v1 is valid."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          RELEASE_TAG="v${RELEASE_NUMBER}"
+          RELEASE_JSON=$(gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")
+          PUBLISHED_AT=$(printf '%s' "$RELEASE_JSON" | jq -r '.published_at // empty')
+          APK_FILENAME=$(printf '%s' "$RELEASE_JSON" | jq -r '.assets[]? | select(.name | endswith(".apk")) | .name' | head -1)
+          DIGEST=$(printf '%s' "$RELEASE_JSON" | jq -r --arg name "$APK_FILENAME" '.assets[]? | select(.name == $name) | .digest // empty' | head -1)
+
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+$ ]]
+          test -n "$APK_FILENAME"
+
+          TAG_JSON=$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")
+          RELEASE_COMMIT=$(printf '%s' "$TAG_JSON" | jq -r '.object.sha // empty')
+          TAG_TYPE=$(printf '%s' "$TAG_JSON" | jq -r '.object.type // empty')
+          if [ "$TAG_TYPE" = "tag" ]; then
+            TAG_OBJECT=$(gh api "/repos/$GITHUB_REPOSITORY/git/tags/$RELEASE_COMMIT")
+            RELEASE_COMMIT=$(printf '%s' "$TAG_OBJECT" | jq -r '.object.sha // empty')
+          fi
+          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+
+          VERIFY_DIR="$RUNNER_TEMP/release-docs-verify"
+          rm -rf "$VERIFY_DIR"
+          mkdir -p "$VERIFY_DIR"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$APK_FILENAME" --dir "$VERIFY_DIR"
+          test -s "$VERIFY_DIR/$APK_FILENAME"
+
+          APK_SHA256=$(sha256sum "$VERIFY_DIR/$APK_FILENAME" | awk '{print $1}')
+          [[ "$APK_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]
+          if [[ "$DIGEST" == sha256:* ]]; then
+            test "$APK_SHA256" = "${DIGEST#sha256:}"
+          fi
+
+          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
+          BADGING=$("$AAPT" dump badging "$VERIFY_DIR/$APK_FILENAME")
+          PACKAGE_ID=$(printf '%s\n' "$BADGING" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -1)
+          VERSION_CODE=$(printf '%s\n' "$BADGING" | sed -n "s/^package: .*versionCode='\([^']*\)'.*/\1/p" | head -1)
+          VERSION_NAME=$(printf '%s\n' "$BADGING" | sed -n "s/^package: .*versionName='\([^']*\)'.*/\1/p" | head -1)
+
+          test "$PACKAGE_ID" = "com.evrasia.hd"
+          [[ "$VERSION_CODE" =~ ^[0-9]+$ ]]
+          test -n "$VERSION_NAME"
+
+          python3 .github/scripts/update-release-docs.py --release-tag "$RELEASE_TAG" --release-commit "$RELEASE_COMMIT" --artifact-filename "$APK_FILENAME" --sha256 "$APK_SHA256" --published-at "$PUBLISHED_AT" --package-id "$PACKAGE_ID" --version-code "$VERSION_CODE" --version-name "$VERSION_NAME"
+
+          git diff --check
+          test -f REFACTORING.md
+          grep -F "Актуально для релиза: **$RELEASE_TAG**" REFACTORING.md
+          if ! git diff --exit-code -- README.md ARCHITECTURE.md CHANGELOG.md RELEASE.md REFACTORING.md .release/latest.json; then
+            echo "Release documentation is not deterministic for the latest published release"
+            exit 1
+          fi
