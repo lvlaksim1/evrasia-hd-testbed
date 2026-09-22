@@ -1,0 +1,123 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: apk-release
+  queue: max
+
+jobs:
+  release-apk:
+    uses: ./.github/workflows/_release-apk.yml
+    with:
+      project_name: Евразия HD
+      expected_package_id: com.evrasia.hd
+      expected_cert_sha256: bf2457663e2b3f4eff5e06dcb83dda67f93f4b3ef7059ce6976e26333d2eca1f
+    secrets:
+      ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+  update-release-docs:
+    if: ${{ contains(github.event.head_commit.message, '[release]') }}
+    needs: release-apk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout current main with release history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true # intentional: this job commits generated release documentation
+
+      - name: Read published release metadata
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NUMBER: ${{ needs.release-apk.outputs.release_number }}
+          APK_FILENAME: ${{ needs.release-apk.outputs.apk_filename }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_NUMBER" =~ ^[0-9]+$ ]]
+          test -n "$APK_FILENAME"
+
+          RELEASE_TAG="v${RELEASE_NUMBER}"
+          RELEASE_JSON=$(gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")
+          TARGET_COMMIT=$(printf '%s' "$RELEASE_JSON" | jq -r '.target_commitish // empty')
+          PUBLISHED_AT=$(printf '%s' "$RELEASE_JSON" | jq -r '.published_at // empty')
+          test "$TARGET_COMMIT" = "$GITHUB_SHA"
+
+          DIGEST=$(printf '%s' "$RELEASE_JSON" | jq -r --arg name "$APK_FILENAME" '.assets[]? | select(.name == $name) | .digest // empty' | head -1)
+          if [[ "$DIGEST" == sha256:* ]]; then
+            SHA256="${DIGEST#sha256:}"
+          else
+            VERIFY_DIR="$RUNNER_TEMP/release-docs-verify"
+            rm -rf "$VERIFY_DIR"
+            mkdir -p "$VERIFY_DIR"
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$APK_FILENAME" --dir "$VERIFY_DIR"
+            SHA256=$(sha256sum "$VERIFY_DIR/$APK_FILENAME" | awk '{print $1}')
+          fi
+          [[ "$SHA256" =~ ^[0-9a-fA-F]{64}$ ]]
+
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "apk_filename=$APK_FILENAME" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "published_at=$PUBLISHED_AT" >> "$GITHUB_OUTPUT"
+
+      - name: Regenerate release documentation
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_NUMBER: ${{ needs.release-apk.outputs.release_number }}
+          APK_FILENAME: ${{ steps.release.outputs.apk_filename }}
+          APK_SHA256: ${{ steps.release.outputs.sha256 }}
+          PUBLISHED_AT: ${{ steps.release.outputs.published_at }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          python3 .github/scripts/update-release-docs.py --release-tag "$RELEASE_TAG" --release-commit "$GITHUB_SHA" --artifact-filename "$APK_FILENAME" --sha256 "$APK_SHA256" --published-at "$PUBLISHED_AT" --package-id "com.evrasia.hd" --version-code "$RELEASE_NUMBER" --version-name "$RELEASE_TAG"
+          git diff --check
+          grep -F "Версия: **$RELEASE_TAG**" README.md
+          grep -F "Актуально для релиза: **$RELEASE_TAG**" ARCHITECTURE.md
+          grep -F "Релиз: **$RELEASE_TAG**" RELEASE.md
+          grep -F "Актуально для релиза: **$RELEASE_TAG**" REFACTORING.md
+          grep -F "## $RELEASE_TAG —" CHANGELOG.md
+          jq -e --arg tag "$RELEASE_TAG" '.tag == $tag and .schemaVersion == 1' .release/latest.json >/dev/null
+
+      - name: Commit updated documentation
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- README.md ARCHITECTURE.md CHANGELOG.md RELEASE.md REFACTORING.md .release/latest.json; then
+            echo "Release documentation is already current"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md ARCHITECTURE.md CHANGELOG.md RELEASE.md REFACTORING.md .release/latest.json
+          git commit -m "docs: update release documentation for ${RELEASE_TAG}"
+
+          for ATTEMPT in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "Release documentation updated for ${RELEASE_TAG}"
+              exit 0
+            fi
+            git pull --rebase origin main
+            sleep $((ATTEMPT * 2))
+          done
+
+          echo "Could not publish release documentation update"
+          exit 1
