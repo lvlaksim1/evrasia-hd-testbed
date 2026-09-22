@@ -1,0 +1,140 @@
+name: L1 Work Branch Cleanup
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: work-branch-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Clean completed work branches
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -u
+
+          STALE_SECONDS=$((7 * 24 * 60 * 60))
+          NOW_EPOCH=$(date +%s)
+          DELETED=()
+          RETAINED=()
+          ERRORS=()
+
+          if ! git fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'; then
+            ERRORS+=("Could not fetch remote branches")
+          else
+            MAIN_REF="refs/remotes/origin/main"
+            if ! MAIN_SHA=$(git rev-parse "$MAIN_REF" 2>/dev/null); then
+              ERRORS+=("Could not resolve origin/main")
+            else
+              mapfile -t WORK_REFS < <(git for-each-ref --format='%(refname)' refs/remotes/origin | sed -n '/-work$/p')
+
+              for REF in "${WORK_REFS[@]}"; do
+                BRANCH="${REF#refs/remotes/origin/}"
+
+                if [ -z "$BRANCH" ] || [ "$BRANCH" = "main" ]; then
+                  continue
+                fi
+
+                if ! BRANCH_SHA=$(git rev-parse "$REF" 2>/dev/null); then
+                  ERRORS+=("$BRANCH — could not resolve branch SHA")
+                  continue
+                fi
+
+                if [ "$BRANCH_SHA" = "$MAIN_SHA" ]; then
+                  if git push origin --delete "$BRANCH"; then
+                    DELETED+=("$BRANCH — HEAD matches main")
+                  else
+                    ERRORS+=("$BRANCH — deletion failed")
+                  fi
+                  continue
+                fi
+
+                if [ "$EVENT_NAME" != "schedule" ]; then
+                  UNIQUE_COUNT=$(git rev-list --count "$MAIN_REF..$REF" 2>/dev/null || printf '?')
+                  RETAINED+=("$BRANCH — HEAD differs from main; unique commits: $UNIQUE_COUNT")
+                  continue
+                fi
+
+                if git merge-base --is-ancestor "$REF" "$MAIN_REF"; then
+                  LAST_COMMIT_EPOCH=$(git show -s --format=%ct "$REF" 2>/dev/null || printf '0')
+                  if ! [[ "$LAST_COMMIT_EPOCH" =~ ^[0-9]+$ ]] || [ "$LAST_COMMIT_EPOCH" -le 0 ]; then
+                    ERRORS+=("$BRANCH — could not determine last commit age")
+                    continue
+                  fi
+
+                  AGE_SECONDS=$((NOW_EPOCH - LAST_COMMIT_EPOCH))
+                  AGE_DAYS=$((AGE_SECONDS / 86400))
+
+                  if [ "$AGE_SECONDS" -ge "$STALE_SECONDS" ]; then
+                    if git push origin --delete "$BRANCH"; then
+                      DELETED+=("$BRANCH — fully merged into main and stale for ${AGE_DAYS}d")
+                    else
+                      ERRORS+=("$BRANCH — stale branch deletion failed")
+                    fi
+                  else
+                    RETAINED+=("$BRANCH — fully merged, but only ${AGE_DAYS}d old")
+                  fi
+                else
+                  UNIQUE_COUNT=$(git rev-list --count "$MAIN_REF..$REF" 2>/dev/null || printf '?')
+                  RETAINED+=("$BRANCH — contains unique commits: $UNIQUE_COUNT")
+                fi
+              done
+            fi
+          fi
+
+          {
+            echo "## Work branch cleanup"
+            echo
+            echo "**Trigger:** `$EVENT_NAME`"
+            echo
+            echo "### Deleted"
+            if [ "${#DELETED[@]}" -eq 0 ]; then
+              echo "_None_"
+            else
+              for ITEM in "${DELETED[@]}"; do
+                printf -- '- %s\n' "$ITEM"
+              done
+            fi
+            echo
+            echo "### Retained"
+            if [ "${#RETAINED[@]}" -eq 0 ]; then
+              echo "_None_"
+            else
+              for ITEM in "${RETAINED[@]}"; do
+                printf -- '- %s\n' "$ITEM"
+              done
+            fi
+            echo
+            echo "### Errors"
+            if [ "${#ERRORS[@]}" -eq 0 ]; then
+              echo "_None_"
+            else
+              for ITEM in "${ERRORS[@]}"; do
+                printf -- '- %s\n' "$ITEM"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${#ERRORS[@]}" -gt 0 ]; then
+            exit 1
+          fi
