@@ -1,0 +1,700 @@
+name: L2 Universal APK Release
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "release or validate"
+        required: false
+        default: "release"
+        type: string
+      project_name:
+        description: "Human-readable project name; required for release"
+        required: false
+        default: ""
+        type: string
+      expected_package_id:
+        required: true
+        type: string
+      expected_cert_sha256:
+        description: "Production signing certificate SHA-256; required only for release mode"
+        required: false
+        default: ""
+        type: string
+    secrets:
+      ANDROID_KEYSTORE:
+        required: false
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+    outputs:
+      release_number:
+        description: "Published APK release number"
+        value: ${{ jobs.build-sign-verify.outputs.effective_release_number }}
+      apk_filename:
+        description: "Published APK file name"
+        value: ${{ jobs.build-sign-verify.outputs.apk_filename }}
+      apk_size_bytes:
+        description: "Final signed APK size in bytes"
+        value: ${{ jobs.build-sign-verify.outputs.apk_size_bytes }}
+      apk_size_mib:
+        description: "Final signed APK size in MiB"
+        value: ${{ jobs.build-sign-verify.outputs.apk_size_mib }}
+
+jobs:
+  prepare-release:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_release-core.yml
+    with:
+      mode: prepare
+
+  build-sign-verify:
+    if: ${{ inputs.mode == 'validate' || needs.prepare-release.outputs.release_requested == 'true' }}
+    needs: prepare-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    outputs:
+      effective_release_number: ${{ steps.metadata.outputs.release_number }}
+      apk_filename: ${{ steps.metadata.outputs.apk_filename }}
+      apk_size_bytes: ${{ steps.apk-size.outputs.apk_size_bytes }}
+      apk_size_mib: ${{ steps.apk-size.outputs.apk_size_mib }}
+      apk_size_delta: ${{ steps.apk-size.outputs.apk_size_delta }}
+      telegram_release_notes: ${{ steps.release-notes.outputs.text }}
+    steps:
+      - name: Define APK metadata
+        id: metadata
+        env:
+          MODE: ${{ inputs.mode }}
+          RELEASE_REQUESTED: ${{ needs.prepare-release.outputs.release_requested }}
+          PREPARED_RELEASE_NUMBER: ${{ needs.prepare-release.outputs.release_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$MODE" in
+            release)
+              test "$RELEASE_REQUESTED" = "true"
+              [[ "$PREPARED_RELEASE_NUMBER" =~ ^[0-9]+$ ]]
+              RELEASE_NUMBER="$PREPARED_RELEASE_NUMBER"
+              ;;
+            validate)
+              RELEASE_NUMBER=9999
+              ;;
+            *)
+              echo "Unsupported APK workflow mode: $MODE"
+              exit 1
+              ;;
+          esac
+
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          echo "release_number=$RELEASE_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "apk_filename=${REPO_NAME}-v${RELEASE_NUMBER}.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Russian release notes
+        if: ${{ inputs.mode == 'release' }}
+        id: release-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_COMMIT_MESSAGE=$(gh api "/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" --jq '.commit.message')
+          export RELEASE_COMMIT_MESSAGE
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          message = os.environ.get("RELEASE_COMMIT_MESSAGE", "")
+          lines = message.splitlines()
+          heading = next((index for index, line in enumerate(lines) if line.strip().casefold() == "изменения:"), None)
+          if heading is None:
+              raise SystemExit(
+                  "Release commit must contain a Russian 'Изменения:' section with bullet points."
+              )
+
+          notes = []
+          for raw in lines[heading + 1:]:
+              stripped = raw.strip()
+              if not stripped:
+                  continue
+              if not stripped.startswith(("-", "*", "•")):
+                  continue
+              note = re.sub(r"^[\-\*•]\s*", "", stripped).strip()
+              if not note:
+                  continue
+              if not re.search(r"[А-Яа-яЁё]", note):
+                  raise SystemExit(f"Release note must be in Russian: {note}")
+              notes.append(note)
+
+          if not notes:
+              raise SystemExit(
+                  "Release commit 'Изменения:' section must contain at least one Russian bullet point."
+              )
+
+          bullets = [f"• {note}" for note in notes]
+          while len("\n".join(bullets)) > 800 and len(bullets) > 1:
+              bullets.pop()
+          text = "\n".join(bullets)
+          if len(text) > 800:
+              text = text[:799].rstrip() + "…"
+
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as handle:
+              handle.write("text<<RUSSIAN_RELEASE_NOTES\n")
+              handle.write(text)
+              handle.write("\nRUSSIAN_RELEASE_NOTES\n")
+          PY
+
+      - name: Checkout exact source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+
+      - name: Install universal APK tools
+        shell: bash
+        run: sdkmanager --install "build-tools;35.0.0"
+
+      - name: Build project APK candidate
+        id: project-build
+        uses: ./.github/actions/build-apk
+        with:
+          release_number: ${{ steps.metadata.outputs.release_number }}
+
+      - name: Validate unsigned APK candidate
+        env:
+          CANDIDATE_APK: ${{ steps.project-build.outputs.apk_path }}
+          RELEASE_NUMBER: ${{ steps.metadata.outputs.release_number }}
+          EXPECTED_PACKAGE_ID: ${{ inputs.expected_package_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -n "$CANDIDATE_APK"
+          test -s "$CANDIDATE_APK"
+
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
+          test -x "$APKSIGNER"
+          test -x "$AAPT"
+
+          BADGING=$("$AAPT" dump badging "$CANDIDATE_APK")
+          printf '%s\n' "$BADGING" | grep -F "package: name='${EXPECTED_PACKAGE_ID}'"
+          printf '%s\n' "$BADGING" | grep -F "versionCode='${RELEASE_NUMBER}'"
+          printf '%s\n' "$BADGING" | grep -F "versionName='v${RELEASE_NUMBER}'"
+
+          if "$APKSIGNER" verify "$CANDIDATE_APK" >/dev/null 2>&1; then
+            echo "L3 build adapter returned an already-signed APK; unsigned candidate required"
+            exit 1
+          fi
+
+      - name: Verify APK native architecture
+        env:
+          CANDIDATE_APK: ${{ steps.project-build.outputs.apk_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t ABIS < <(unzip -Z1 "$CANDIDATE_APK" | awk -F/ '$1 == "lib" && NF >= 3 {print $2}' | sort -u)
+
+          if [ "${#ABIS[@]}" -eq 0 ]; then
+            echo "APK contains no native libraries; architecture-independent APK accepted"
+            exit 0
+          fi
+
+          printf 'Native ABIs: %s\n' "${ABIS[*]}"
+
+          if ! printf '%s\n' "${ABIS[@]}" | grep -Fxq 'arm64-v8a'; then
+            echo "APK does not contain required arm64-v8a native libraries"
+            exit 1
+          fi
+
+          if printf '%s\n' "${ABIS[@]}" | grep -Fvxq 'arm64-v8a'; then
+            echo "APK contains native ABI other than arm64-v8a"
+            exit 1
+          fi
+
+      - name: Sign and verify APK
+        if: ${{ inputs.mode == 'release' }}
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          RELEASE_APK_FILENAME: ${{ steps.metadata.outputs.apk_filename }}
+          CANDIDATE_APK: ${{ steps.project-build.outputs.apk_path }}
+          EXPECTED_CERT_SHA256: ${{ inputs.expected_cert_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ANDROID_KEYSTORE:-}" ]; then
+            echo "ANDROID_KEYSTORE is not configured"
+            exit 1
+          fi
+          if ! [[ "$EXPECTED_CERT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "expected_cert_sha256 must be a 64-character SHA-256 value in release mode"
+            exit 1
+          fi
+
+          SIGN_DIR="$RUNNER_TEMP/android-signing"
+          SIGN_ZIP="$RUNNER_TEMP/android-signing.zip"
+          trap 'rm -rf "$SIGN_DIR" "$SIGN_ZIP"' EXIT
+
+          mkdir -p "$SIGN_DIR"
+          printf '%s' "$ANDROID_KEYSTORE" | base64 --decode > "$SIGN_ZIP"
+          unzip -q "$SIGN_ZIP" -d "$SIGN_DIR"
+          test -s "$SIGN_DIR/key.pk8"
+          test -s "$SIGN_DIR/cert.pem"
+          chmod 600 "$SIGN_DIR/key.pk8"
+
+          CERT_SHA256=$(openssl x509 -in "$SIGN_DIR/cert.pem" -outform DER | sha256sum | awk '{print $1}')
+          if [ "$CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "Unexpected Android signing certificate"
+            exit 1
+          fi
+
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          test -x "$APKSIGNER"
+
+          "$APKSIGNER" sign --key "$SIGN_DIR/key.pk8" --cert "$SIGN_DIR/cert.pem" --out "$RELEASE_APK_FILENAME" "$CANDIDATE_APK"
+          "$APKSIGNER" verify --verbose --print-certs "$RELEASE_APK_FILENAME"
+
+      - name: Analyze APK size
+        if: ${{ inputs.mode == 'release' }}
+        id: apk-size
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          RELEASE_NUMBER: ${{ steps.metadata.outputs.release_number }}
+          RELEASE_APK_FILENAME: ${{ steps.metadata.outputs.apk_filename }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s "$RELEASE_APK_FILENAME"
+
+          HISTORY_FILE="$RUNNER_TEMP/apk-release-sizes.tsv"
+          : > "$HISTORY_FILE"
+          gh api --paginate "/repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name as $tag | select($tag | test("^v[0-9]+$")) | .assets[]? | select(.name | endswith(".apk")) | [$tag, (.size | tostring)] | @tsv' > "$HISTORY_FILE" 2>/dev/null || true
+
+          PREVIOUS_ROW=$(awk -F '\t' -v current="$RELEASE_NUMBER" '$1 ~ /^v[0-9]+$/ {n=substr($1,2)+0; if (n < current+0) print n "\t" $1 "\t" $2}' "$HISTORY_FILE" | sort -n | tail -1)
+          PREVIOUS_TAG=$(printf '%s' "$PREVIOUS_ROW" | cut -f2)
+          PREVIOUS_SIZE=$(printf '%s' "$PREVIOUS_ROW" | cut -f3)
+
+          export APK_SIZE_HISTORY_FILE="$HISTORY_FILE"
+          export PREVIOUS_TAG
+          export PREVIOUS_SIZE
+
+          python3 - <<'PY'
+          import os
+          import re
+          import zipfile
+          from pathlib import Path
+
+          apk_path = Path(os.environ["RELEASE_APK_FILENAME"])
+          apk_size = apk_path.stat().st_size
+          mib = 1024 * 1024
+
+          category_order = [
+              "Native libraries",
+              "DEX / bytecode",
+              "JS / Hermes bundle",
+              "Android resources",
+              "Other assets",
+              "Other",
+          ]
+          categories = {name: {"compressed": 0, "uncompressed": 0} for name in category_order}
+          entries = []
+
+          with zipfile.ZipFile(apk_path) as archive:
+              for info in archive.infolist():
+                  if info.is_dir():
+                      continue
+                  name = info.filename
+                  compressed = info.compress_size
+                  uncompressed = info.file_size
+
+                  if name.startswith("lib/") and name.endswith(".so"):
+                      category = "Native libraries"
+                  elif re.fullmatch(r"(?:.*/)?classes\d*\.dex", name):
+                      category = "DEX / bytecode"
+                  elif "index.android.bundle" in name or name.endswith(".bundle") or name.endswith(".hbc"):
+                      category = "JS / Hermes bundle"
+                  elif name.startswith("res/") or name in {"resources.arsc", "AndroidManifest.xml"}:
+                      category = "Android resources"
+                  elif name.startswith("assets/"):
+                      category = "Other assets"
+                  else:
+                      category = "Other"
+
+                  categories[category]["compressed"] += compressed
+                  categories[category]["uncompressed"] += uncompressed
+                  entries.append((compressed, uncompressed, name))
+
+          zip_payload = sum(item["compressed"] for item in categories.values())
+          container_overhead = max(0, apk_size - zip_payload)
+          categories["Other"]["compressed"] += container_overhead
+          if sum(item["compressed"] for item in categories.values()) != apk_size:
+              raise SystemExit("APK size categories do not add up to the final file size")
+
+          previous_tag = os.environ.get("PREVIOUS_TAG", "")
+          previous_size_raw = os.environ.get("PREVIOUS_SIZE", "")
+          previous_size = int(previous_size_raw) if previous_size_raw.isdigit() else None
+          delta = apk_size - previous_size if previous_size is not None else None
+
+          history = []
+          history_path = Path(os.environ["APK_SIZE_HISTORY_FILE"])
+          if history_path.exists():
+              for line in history_path.read_text(encoding="utf-8").splitlines():
+                  parts = line.split("\t")
+                  if len(parts) != 2 or not re.fullmatch(r"v\d+", parts[0]) or not parts[1].isdigit():
+                      continue
+                  history.append((int(parts[0][1:]), parts[0], int(parts[1])))
+          history.sort()
+          mode = os.environ.get("MODE", "release")
+          current_label = f"v{os.environ['RELEASE_NUMBER']}" if mode == "release" else "candidate"
+          current_number = int(os.environ["RELEASE_NUMBER"])
+          history = [item for item in history if item[0] < current_number]
+          history.append((current_number, current_label, apk_size))
+          recent_history = history[-5:]
+
+          def fmt_mib(value):
+              return f"{value / mib:.2f} MiB"
+
+          def pct(value):
+              return (value / apk_size * 100) if apk_size else 0.0
+
+          top_entries = sorted(entries, key=lambda item: item[0], reverse=True)[:10]
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## APK size audit\n\n")
+              summary.write("| Metric | Value |\n|---|---:|\n")
+              summary.write(f"| Final signed APK | **{fmt_mib(apk_size)}** ({apk_size:,} bytes) |\n")
+              if previous_size is not None:
+                  sign = "+" if delta >= 0 else ""
+                  summary.write(f"| Previous release | {previous_tag}: {fmt_mib(previous_size)} |\n")
+                  summary.write(f"| Delta vs {previous_tag} | **{sign}{delta / mib:.2f} MiB** ({sign}{delta:,} bytes) |\n")
+              else:
+                  summary.write("| Previous release | n/a |\n")
+              summary.write("\n### Compressed contribution to APK\n\n")
+              summary.write("| Category | Compressed | APK share | Uncompressed |\n|---|---:|---:|---:|\n")
+              for name in category_order:
+                  item = categories[name]
+                  summary.write(f"| {name} | {fmt_mib(item['compressed'])} | {pct(item['compressed']):.1f}% | {fmt_mib(item['uncompressed'])} |\n")
+
+              summary.write("\n### Largest APK entries\n\n")
+              summary.write("| # | Entry | Compressed | Uncompressed |\n|---:|---|---:|---:|\n")
+              for number, (compressed, uncompressed, name) in enumerate(top_entries, 1):
+                  safe_name = name.replace("|", "\\|")
+                  summary.write(f"| {number} | `{safe_name}` | {fmt_mib(compressed)} | {fmt_mib(uncompressed)} |\n")
+
+              summary.write("\n### Recent APK size history\n\n")
+              summary.write("| Release | APK size |\n|---|---:|\n")
+              for _, tag, size in recent_history:
+                  summary.write(f"| {tag} | {fmt_mib(size)} |\n")
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          with output_path.open("a", encoding="utf-8") as output:
+              output.write(f"apk_size_bytes={apk_size}\n")
+              output.write(f"apk_size_mib={apk_size / mib:.2f}\n")
+              output.write(f"apk_size_delta={delta / mib:+.2f}" if delta is not None else "apk_size_delta=n/a")
+              output.write("\n")
+          PY
+
+      - name: Write APK verification summary
+        env:
+          MODE: ${{ inputs.mode }}
+          RELEASE_NUMBER: ${{ steps.metadata.outputs.release_number }}
+          RELEASE_APK_FILENAME: ${{ steps.metadata.outputs.apk_filename }}
+          CANDIDATE_APK: ${{ steps.project-build.outputs.apk_path }}
+          EXPECTED_PACKAGE_ID: ${{ inputs.expected_package_id }}
+          EXPECTED_CERT_SHA256: ${{ inputs.expected_cert_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ABIS=$(unzip -Z1 "$CANDIDATE_APK" | awk -F/ '$1 == "lib" && NF >= 3 {print $2}' | sort -u | paste -sd ',' -)
+          if [ -z "$ABIS" ]; then
+            ABIS="architecture-independent"
+          fi
+          CANDIDATE_SHA256=$(sha256sum "$CANDIDATE_APK" | awk '{print $1}')
+
+          if [ "$MODE" = "release" ]; then
+            test -s "$RELEASE_APK_FILENAME"
+            FINAL_APK_SHA256=$(sha256sum "$RELEASE_APK_FILENAME" | awk '{print $1}')
+            SIGNING_STATUS="production certificate $EXPECTED_CERT_SHA256"
+            FINAL_APK="$RELEASE_APK_FILENAME"
+          else
+            FINAL_APK_SHA256="not created"
+            SIGNING_STATUS="not performed (validation mode)"
+            FINAL_APK="not created"
+          fi
+
+          {
+            echo "## APK verification"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            printf '| Mode | `%s` |\n' "$MODE"
+            printf '| Commit | `%s` |\n' "$GITHUB_SHA"
+            printf '| Package | `%s` |\n' "$EXPECTED_PACKAGE_ID"
+            printf '| versionCode | `%s` |\n' "$RELEASE_NUMBER"
+            printf '| versionName | `v%s` |\n' "$RELEASE_NUMBER"
+            printf '| Native ABI | `%s` |\n' "$ABIS"
+            printf '| Unsigned candidate SHA-256 | `%s` |\n' "$CANDIDATE_SHA256"
+            printf '| Production signing | `%s` |\n' "$SIGNING_STATUS"
+            printf '| Signed APK | `%s` |\n' "$FINAL_APK"
+            printf '| Signed APK SHA-256 | `%s` |\n' "$FINAL_APK_SHA256"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload release APK artifact
+        if: ${{ inputs.mode == 'release' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-artifact
+          path: ${{ steps.metadata.outputs.apk_filename }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: ${{ inputs.mode == 'release' }}
+    needs: build-sign-verify
+    permissions:
+      contents: write
+      actions: write
+    uses: ./.github/workflows/_release-core.yml
+    with:
+      mode: publish
+      project_name: ${{ inputs.project_name }}
+      release_number: ${{ needs.build-sign-verify.outputs.effective_release_number }}
+      artifact_filename: ${{ needs.build-sign-verify.outputs.apk_filename }}
+
+  retain-apk-history:
+    if: ${{ inputs.mode == 'release' }}
+    needs:
+      - build-sign-verify
+      - publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Keep only current and previous APK binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_NUMBER: ${{ needs.build-sign-verify.outputs.effective_release_number }}
+        shell: bash
+        run: |
+          set +e
+          CURRENT_TAG="v${CURRENT_NUMBER}"
+
+          ASSET_ROWS=$(gh api --paginate "/repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | .tag_name as $tag | select($tag | test("^v[0-9]+$")) | .assets[]? | select((.name | endswith(".apk")) or (.name | endswith(".apk.sha256"))) | [$tag, (.id | tostring), .name] | @tsv')
+          if [ $? -ne 0 ]; then
+            echo "::warning::Could not list release assets for APK retention cleanup"
+            exit 0
+          fi
+
+          PREVIOUS_NUMBER=$(printf '%s\n' "$ASSET_ROWS" | awk -F '\t' -v current="$CURRENT_NUMBER" '$3 ~ /\.apk$/ {n=substr($1,2)+0; if (n < current+0) print n}' | sort -n | tail -1)
+          PREVIOUS_TAG=""
+          if [ -n "$PREVIOUS_NUMBER" ]; then
+            PREVIOUS_TAG="v${PREVIOUS_NUMBER}"
+          fi
+
+          CLEANUP_FAILED=false
+          while IFS=$'\t' read -r TAG ASSET_ID ASSET_NAME; do
+            [ -z "$ASSET_ID" ] && continue
+
+            DELETE_ASSET=false
+            case "$ASSET_NAME" in
+              *.apk.sha256)
+                DELETE_ASSET=true
+                ;;
+              *.apk)
+                if [ "$TAG" != "$CURRENT_TAG" ] && { [ -z "$PREVIOUS_TAG" ] || [ "$TAG" != "$PREVIOUS_TAG" ]; }; then
+                  DELETE_ASSET=true
+                fi
+                ;;
+            esac
+
+            if [ "$DELETE_ASSET" = "true" ]; then
+              if ! gh api --method DELETE "/repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID" >/dev/null; then
+                CLEANUP_FAILED=true
+              fi
+            fi
+          done <<< "$ASSET_ROWS"
+
+          if [ "$CLEANUP_FAILED" = "true" ]; then
+            echo "::warning::Release succeeded, but some old APK assets could not be deleted"
+          fi
+          exit 0
+
+  telegram:
+    if: ${{ inputs.mode == 'release' }}
+    outputs:
+      notification_status: ${{ steps.notify.outputs.status }}
+    needs:
+      - build-sign-verify
+      - publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Send APK or link to Telegram
+        id: notify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PROJECT_NAME: ${{ inputs.project_name }}
+          RELEASE_NUMBER: ${{ needs.build-sign-verify.outputs.effective_release_number }}
+          RELEASE_APK_FILENAME: ${{ needs.build-sign-verify.outputs.apk_filename }}
+          RELEASE_NOTES_RU: ${{ needs.build-sign-verify.outputs.telegram_release_notes }}
+        shell: bash
+        run: |
+          set -u
+
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "status=not-configured" >> "$GITHUB_OUTPUT"
+            echo "::warning::GitHub Release published, but Telegram secrets are not configured"
+            exit 0
+          fi
+
+          API="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
+          RELEASE_TAG="v${RELEASE_NUMBER}"
+          APK_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${RELEASE_APK_FILENAME}"
+          TELEGRAM_MAX_FILE_BYTES=$((50 * 1024 * 1024))
+          DELIVERY_MODE="link"
+          APK_PATH=""
+
+          RELEASE_JSON=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" 2>/dev/null || true)
+          APK_SIZE=$(printf '%s' "$RELEASE_JSON" | jq -r --arg name "$RELEASE_APK_FILENAME" '.assets[]? | select(.name == $name) | .size // empty' | head -1)
+
+          if [[ "$APK_SIZE" =~ ^[0-9]+$ ]]; then
+            echo "Published APK size: $APK_SIZE bytes"
+            if [ "$APK_SIZE" -le "$TELEGRAM_MAX_FILE_BYTES" ]; then
+              TELEGRAM_DIR="$RUNNER_TEMP/telegram-apk"
+              rm -rf "$TELEGRAM_DIR"
+              mkdir -p "$TELEGRAM_DIR"
+
+              if gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$RELEASE_APK_FILENAME" --dir "$TELEGRAM_DIR" >/dev/null 2>&1; then
+                APK_PATH="$TELEGRAM_DIR/$RELEASE_APK_FILENAME"
+                if [ -s "$APK_PATH" ]; then
+                  ACTUAL_APK_SIZE=$(stat -c%s "$APK_PATH")
+                  echo "Downloaded APK size: $ACTUAL_APK_SIZE bytes"
+                  if [ "$ACTUAL_APK_SIZE" -le "$TELEGRAM_MAX_FILE_BYTES" ]; then
+                    DELIVERY_MODE="apk"
+                  else
+                    echo "::warning::Downloaded APK exceeds Telegram 50 MiB upload limit; sending release link instead"
+                  fi
+                else
+                  echo "::warning::Downloaded APK is missing or empty; sending release link instead"
+                fi
+              else
+                echo "::warning::Could not download published APK; sending release link instead"
+              fi
+            else
+              echo "APK exceeds Telegram 50 MiB upload limit; sending release link"
+            fi
+          else
+            echo "::warning::Could not determine published APK size; sending release link instead"
+          fi
+
+          SUCCESS=false
+          if [ "$DELIVERY_MODE" = "apk" ]; then
+            printf -v CAPTION '%s %s собран успешно.\n\nИзменения:\n%s' "$PROJECT_NAME" "$RELEASE_TAG" "$RELEASE_NOTES_RU"
+            for ATTEMPT in 1 2 3; do
+              if RESPONSE=$(curl --silent --show-error --fail-with-body -X POST "$API/sendDocument" -F "chat_id=${TELEGRAM_CHAT_ID}" -F "document=@${APK_PATH};type=application/vnd.android.package-archive" -F "caption=${CAPTION}"); then
+                if printf '%s' "$RESPONSE" | jq -e '.ok == true' >/dev/null 2>&1; then
+                  SUCCESS=true
+                  break
+                fi
+              fi
+              if [ "$ATTEMPT" -lt 3 ]; then
+                sleep $((ATTEMPT * 5))
+              fi
+            done
+          else
+            printf -v TEXT '%s %s собран успешно.\n\nИзменения:\n%s\n\nAPK превышает лимит отправки файла или файл недоступен для загрузки ботом.\nСкачать APK:\n%s' "$PROJECT_NAME" "$RELEASE_TAG" "$RELEASE_NOTES_RU" "$APK_URL"
+            for ATTEMPT in 1 2 3; do
+              if RESPONSE=$(curl --silent --show-error --fail-with-body -X POST "$API/sendMessage" --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" --data-urlencode "text=${TEXT}"); then
+                if printf '%s' "$RESPONSE" | jq -e '.ok == true' >/dev/null 2>&1; then
+                  SUCCESS=true
+                  break
+                fi
+              fi
+              if [ "$ATTEMPT" -lt 3 ]; then
+                sleep $((ATTEMPT * 5))
+              fi
+            done
+          fi
+
+          if [ "$SUCCESS" = "true" ]; then
+            if [ "$DELIVERY_MODE" = "apk" ]; then
+              echo "status=sent-apk" >> "$GITHUB_OUTPUT"
+            else
+              echo "status=sent-link" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            echo "::warning::GitHub Release published successfully, but Telegram notification failed after 3 attempts"
+          fi
+
+  release-summary:
+    if: ${{ always() && inputs.mode == 'release' && needs.build-sign-verify.result != 'skipped' }}
+    needs:
+      - build-sign-verify
+      - publish
+      - retain-apk-history
+      - telegram
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Write APK release run summary
+        env:
+          RELEASE_NUMBER: ${{ needs.build-sign-verify.outputs.effective_release_number }}
+          APK_FILENAME: ${{ needs.build-sign-verify.outputs.apk_filename }}
+          BUILD_RESULT: ${{ needs.build-sign-verify.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          RETENTION_RESULT: ${{ needs.retain-apk-history.result }}
+          TELEGRAM_JOB_RESULT: ${{ needs.telegram.result }}
+          TELEGRAM_STATUS: ${{ needs.telegram.outputs.notification_status }}
+          APK_SIZE_MIB: ${{ needs.build-sign-verify.outputs.apk_size_mib }}
+          APK_SIZE_DELTA: ${{ needs.build-sign-verify.outputs.apk_size_delta }}
+        shell: bash
+        run: |
+          RELEASE_TAG="v${RELEASE_NUMBER}"
+          RELEASE_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
+          APK_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$APK_FILENAME"
+
+          {
+            echo "## APK release pipeline"
+            echo
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            printf '| Build / verify / sign | `%s` |\n' "$BUILD_RESULT"
+            printf '| GitHub Release | `%s` |\n' "$PUBLISH_RESULT"
+            printf '| APK retention | `%s` |\n' "$RETENTION_RESULT"
+            printf '| Telegram job | `%s` |\n' "$TELEGRAM_JOB_RESULT"
+            printf '| Telegram delivery | `%s` |\n' "${TELEGRAM_STATUS:-unknown}"
+            printf '| APK size | `%s MiB` |\n' "${APK_SIZE_MIB:-unknown}"
+            printf '| APK size delta | `%s MiB` |\n' "${APK_SIZE_DELTA:-unknown}"
+            echo
+            echo "**Release:** [$RELEASE_TAG]($RELEASE_URL)"
+            echo
+            echo "**APK:** [$APK_FILENAME]($APK_URL)"
+          } >> "$GITHUB_STEP_SUMMARY"
