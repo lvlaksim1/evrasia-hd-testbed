@@ -1,0 +1,11 @@
+{
+  "schema": "context-capsule-manager-identity",
+  "schema_version": 1,
+  "manager_id": "evrasia-hd-project-manager",
+  "role": "Project Manager",
+  "repository": "lvlaksim1/evrasia-hd-testbed",
+  "continuity": "runtime-independent",
+  "authority_model": "bounded-by-mandate",
+  "state_model": "beliefs-goals-intentions-plans",
+  "memory_model": "typed-with-provenance"
+}

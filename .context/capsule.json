@@ -1,0 +1,9 @@
+{
+  "schema": "context-capsule",
+  "version": "2.0.0-dev",
+  "source": "lvlaksim1/context-capsule",
+  "core_commit": "6b8477d382bbf5cd8d13bd914b2374473560a43d",
+  "installed_at": "2026-09-22",
+  "repository": "lvlaksim1/evrasia-hd-testbed",
+  "update_policy": "manual"
+}
