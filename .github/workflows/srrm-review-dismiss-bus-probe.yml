@@ -1,0 +1,55 @@
+name: SRRM Review Dismiss Bus Probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/srrm-review-dismiss-bus-probe.yml'
+  pull_request_review:
+    types: [dismissed]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  bus:
+    if: github.event_name == 'push' || github.event.pull_request.number == 1
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read and reset reaction opcode
+        if: github.event_name == 'pull_request_review'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: "1"
+          OWNER_LOGIN: "lvlaksim1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          json="$(gh api -H "Accept: application/vnd.github+json" "repos/$REPO/issues/$PR_NUMBER/reactions")"
+          mapfile -t rows < <(jq -r --arg u "$OWNER_LOGIN" '.[] | select(.user.login==$u) | [.id,.content,.created_at] | @tsv' <<<"$json")
+          if (( ${#rows[@]} == 0 )); then
+            echo "SRRM_OPCODE=NONE"
+          else
+            last="${rows[-1]}"
+            rid="${last%%$'\t'*}"
+            rest="${last#*$'\t'}"
+            reaction="${rest%%$'\t'*}"
+            echo "SRRM_OPCODE=$reaction"
+            for row in "${rows[@]}"; do
+              id="${row%%$'\t'*}"
+              gh api --method DELETE -H "Accept: application/vnd.github+json" "repos/$REPO/issues/$PR_NUMBER/reactions/$id"
+            done
+            echo "REACTIONS_RESET=${#rows[@]}"
+          fi
+      - name: Seed next standing review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method POST             -H "Accept: application/vnd.github+json"             "repos/$REPO/pulls/$PR_NUMBER/reviews"             -f body='SRRM_STANDING_WAKE_REVIEW'             -f event='REQUEST_CHANGES'
