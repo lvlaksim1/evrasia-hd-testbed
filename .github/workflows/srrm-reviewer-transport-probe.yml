@@ -1,0 +1,25 @@
+name: SRRM Reviewer Transport Probe
+
+on:
+  pull_request_target:
+    types: [review_requested]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  signal-and-rearm:
+    if: github.event.pull_request.number == 1 && github.event.requested_reviewer.login == 'lvlaksim1'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record signal
+        run: |
+          echo "SRRM_REVIEWER_SIGNAL=lvlaksim1"
+          echo "UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      - name: Rearm reviewer signal
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$NUMBER" --repo "$REPO" --remove-reviewer lvlaksim1
