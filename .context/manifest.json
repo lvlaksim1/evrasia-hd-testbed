@@ -95,5 +95,7 @@
     "manager_state_coherence_required": true
   },
   "updated_at": "2026-10-04",
-  "context_version": "2.0.0-dev"
+  "context_version": "2.0.0-dev",
+  "context_capsule_version": "1.3.1",
+  "project_manager_version": "2.0.0-dev"
 }
