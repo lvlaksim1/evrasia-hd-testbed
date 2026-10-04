@@ -94,6 +94,6 @@
     "external_gate_reconciliation_required": true,
     "manager_state_coherence_required": true
   },
-  "updated_at": "2026-10-03",
+  "updated_at": "2026-10-04",
   "context_version": "2.0.0-dev"
 }
